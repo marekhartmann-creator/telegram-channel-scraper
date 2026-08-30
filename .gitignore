@@ -8,3 +8,7 @@ storage/request_queues/
 probe.py
 diag.py
 probe_out.txt
+
+# G-020: tajomstva nikdy do gitu
+.env
+.env.*
