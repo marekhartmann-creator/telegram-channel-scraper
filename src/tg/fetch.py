@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -42,6 +43,7 @@ class FetchResult:
 class FetchStats:
     requests: int = 0
     retries: int = 0
+    proxy_rotations: int = 0
     failures: list[str] = field(default_factory=list)
 
 
@@ -53,6 +55,12 @@ class FetchStats:
 # povedal "pridi o 60 s". Vsetky tri pokusy tak padli do okna, ktore uz bolo
 # zavrete, a beh skoncil ako zlyhanie - hoci stacilo pockat.
 RETRY_AFTER_MAX_S = 120.0
+
+# A6-V7 (R-F74AC6): proxy sa nastavovala RAZ na zaciatku behu a nikdy
+# nerotovala. Jedna zablokovana alebo mrtva vystupna adresa tak zhodila
+# cely beh - vsetky pokusy siahali na cielovy web tou istou cestou.
+# Odteraz sa nova adresa pyta pri chybe spojenia a po N poziadavkach.
+ROTACIA_PO_POZIADAVKACH = 40
 
 
 def _retry_after_seconds(headers: Any) -> float | None:
@@ -86,19 +94,60 @@ class TelegramClient:
         self,
         *,
         proxy_url: str | None = None,
+        proxy_provider: Callable[[], Awaitable[str | None]] | None = None,
         timeout: float = 30.0,
         max_retries: int = 3,
         min_delay: float = 0.25,
+        rotate_after: int = ROTACIA_PO_POZIADAVKACH,
     ) -> None:
-        self._client = httpx.AsyncClient(
-            headers=DEFAULT_HEADERS,
-            timeout=timeout,
-            follow_redirects=True,
-            proxy=proxy_url,
-        )
+        self._timeout = timeout
+        self._proxy_url = proxy_url
+        self._proxy_provider = proxy_provider
+        self._od_rotacie = 0
+        self.rotate_after = rotate_after
+        self._client = self._novy_http_klient(proxy_url)
         self.max_retries = max_retries
         self.min_delay = min_delay
         self.stats = FetchStats()
+
+    @property
+    def proxy_url(self) -> str | None:
+        """Adresa, ktorou klient prave chodi von."""
+        return self._proxy_url
+
+    def _novy_http_klient(self, proxy: str | None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers=DEFAULT_HEADERS,
+            timeout=self._timeout,
+            follow_redirects=True,
+            proxy=proxy,
+        )
+
+    async def _rotuj_proxy(self, dovod: str) -> bool:
+        """Vypytaj novu vystupnu adresu a prepni na nu.
+
+        Bez dodavatela (lokalny beh, ucet bez proxy) sa nic nedeje - proxy
+        nikdy nebola dovod zabit beh a nie je nim ani teraz.
+        """
+        if self._proxy_provider is None:
+            return False
+        try:
+            nova = await self._proxy_provider()
+        except Exception as exc:  # noqa: BLE001
+            self.stats.failures.append(f"proxy rotation failed: {exc}")
+            return False
+        if not nova:
+            return False
+        stary = self._client
+        self._client = self._novy_http_klient(nova)
+        self._proxy_url = nova
+        self._od_rotacie = 0
+        self.stats.proxy_rotations += 1
+        try:
+            await stary.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     async def __aenter__(self) -> "TelegramClient":
         return self
@@ -128,11 +177,17 @@ class TelegramClient:
                 self.stats.retries += 1
                 await asyncio.sleep(self._backoff(attempt, retry_after))
             retry_after = None
+            if self.rotate_after and self._od_rotacie >= self.rotate_after:
+                await self._rotuj_proxy(f"po {self._od_rotacie} poziadavkach")
             try:
                 self.stats.requests += 1
+                self._od_rotacie += 1
                 response = await self._client.get(url)
             except Exception as exc:  # noqa: BLE001 - reported, never swallowed
                 last = FetchResult(url=url, error=f"{type(exc).__name__}: {exc}")
+                # Zlyhane spojenie je najcastejsie mrtva alebo zablokovana
+                # vystupna adresa - dalsi pokus musi ist inou cestou.
+                await self._rotuj_proxy(f"chyba spojenia: {type(exc).__name__}")
                 continue
 
             if response.status_code == 200:

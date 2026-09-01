@@ -82,6 +82,7 @@ async def main() -> None:
         # Apify Proxy password (local runs, plans without proxy access) the SDK
         # raises, and t.me is perfectly reachable directly.
         proxy_url: str | None = None
+        proxy_cfg = None
         try:
             proxy_cfg = await Actor.create_proxy_configuration(
                 actor_proxy_input=raw_input.get("proxyConfiguration")
@@ -89,7 +90,25 @@ async def main() -> None:
             if proxy_cfg:
                 proxy_url = await proxy_cfg.new_url()
         except Exception as exc:  # noqa: BLE001
+            proxy_cfg = None
             Actor.log.warning(f"Proxy unavailable, continuing without it ({exc}).")
+
+        async def dalsia_proxy() -> str | None:
+            """A6-V7 (R-F74AC6): nova vystupna adresa na poziadanie.
+
+            Predtym sa new_url() volalo RAZ pred vytvorenim klienta, takze
+            cely beh sedel na jednej adrese - ked ju t.me zablokovalo,
+            zlyhali vsetky dalsie pokusy rovnako.
+            """
+            if proxy_cfg is None:
+                return None
+            try:
+                nova = await proxy_cfg.new_url()
+            except Exception as exc:  # noqa: BLE001
+                Actor.log.warning(f"Proxy rotation failed, continuing ({exc}).")
+                return None
+            Actor.log.info("Rotated to a new proxy address.")
+            return nova
 
         reports: list[dict[str, Any]] = []
         total_posts = 0
@@ -108,7 +127,9 @@ async def main() -> None:
             else:
                 Actor.log.error(f"{handle}: [{report.state.value}] {report.message}")
 
-        async with TelegramClient(proxy_url=proxy_url) as client:
+        async with TelegramClient(
+            proxy_url=proxy_url, proxy_provider=dalsia_proxy
+        ) as client:
             Actor.log.info(f"Scraping {len(handles)} channel(s): {', '.join(handles)}")
             results = await scrape_channels(client, handles, options, push, announce)
             reports = [report.to_item() for _, report in results]
