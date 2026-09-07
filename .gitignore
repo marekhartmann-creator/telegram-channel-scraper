@@ -12,3 +12,9 @@ probe_out.txt
 # G-020: tajomstva nikdy do gitu
 .env
 .env.*
+*.bak-A3
+*.bak-A3-V6
+*.bak-A6
+*.bak-NOC2
+*.bak-diakritika-*
+*.bak-pouzite-*
